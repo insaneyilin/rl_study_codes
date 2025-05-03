@@ -12,6 +12,17 @@ from rl_utils import ReplayBuffer
 from tqdm import tqdm
 
 
+# We use Pendulum-v1 as an example, which has continuous action space.
+# DQN is designed for discrete action spaces, so we will discretize the
+# continuous action space into a finite number of discrete actions.
+def discrete_to_continuos(discrete_action, env, action_dim):
+    action_lowbound = env.action_space.low[0]
+    action_upbound = env.action_space.high[0]
+    return action_lowbound + (discrete_action /
+                              (action_dim - 1)) * (action_upbound -
+                                                   action_lowbound)
+
+
 class QNetwork(torch.nn.Module):
     """Neural Network for approximating the Q-function.
 
@@ -45,6 +56,64 @@ class QNetwork(torch.nn.Module):
         return self.fc2(x)  # Linear output for Q-values
 
 
+class VAnet(torch.nn.Module):
+    """Dueling DQN Network Architecture that separately estimates state value and action advantages.
+
+    Key components:
+    1. Shared feature extraction layers
+    2. Value stream (V) estimating state value
+    3. Advantage stream (A) estimating action advantages
+    4. Special aggregation layer combining V and A
+
+    Paper reference: "Dueling Network Architectures for Deep Reinforcement Learning" (Wang et al., 2016)
+    """
+
+    def __init__(self, state_dim: int, hidden_dim: int, action_dim: int):
+        """Initialize the dueling network architecture.
+
+        Args:
+            state_dim: Dimension of the input state space
+            hidden_dim: Number of neurons in the hidden layer
+            action_dim: Number of possible actions
+        """
+        super(VAnet, self).__init__()
+
+        # Shared feature extraction layer (common to both streams)
+        self.shared_fc = torch.nn.Linear(state_dim, hidden_dim)
+
+        # Advantage stream head (estimates advantage for each action)
+        self.advantage_stream = torch.nn.Linear(hidden_dim, action_dim)
+
+        # Value stream head (estimates state value)
+        self.value_stream = torch.nn.Linear(hidden_dim, 1)
+
+    def forward(self, state: torch.Tensor) -> torch.Tensor:
+        """Forward pass through the dueling network.
+
+        Args:
+            state: Input state tensor (batch_size × state_dim)
+
+        Returns:
+            Q-values tensor (batch_size × action_dim)
+        """
+        # Shared feature extraction
+        shared_features = F.relu(self.shared_fc(state))
+
+        # Calculate advantage values for each action
+        advantages = self.advantage_stream(shared_features)
+
+        # Calculate state value
+        state_value = self.value_stream(shared_features)
+
+        # Combine streams using dueling architecture formula:
+        # Q(s,a) = V(s) + (A(s,a) - mean_a(A(s,a)))
+        # This helps with identifiability and stable learning
+        q_values = state_value + (advantages -
+                                  advantages.mean(dim=1, keepdim=True))
+
+        return q_values
+
+
 class DQNAgent:
     """Deep Q-Network (DQN) implementation with experience replay and target network.
 
@@ -63,16 +132,30 @@ class DQNAgent:
         target_update (int): Frequency for updating target network
         count (int): Counter for target network updates
         device (torch.device): CPU or GPU for computation
+        dqn_type (str): Type of DQN (VanillaDQN or DoubleDQN or DuelingDQN)
     """
 
-    def __init__(self, state_dim, hidden_dim, action_dim, learning_rate, gamma,
-                 epsilon, target_update, device):
+    def __init__(self,
+                 state_dim,
+                 hidden_dim,
+                 action_dim,
+                 learning_rate,
+                 gamma,
+                 epsilon,
+                 target_update,
+                 device,
+                 dqn_type='VanillaDQN'):
         """Initialize DQN agent with specified parameters."""
         self.action_dim = action_dim
         # Initialize both online and target Q-networks
-        self.q_net = QNetwork(state_dim, hidden_dim, action_dim).to(device)
-        self.target_q_net = QNetwork(state_dim, hidden_dim,
-                                     action_dim).to(device)
+        if dqn_type == 'DuelingDQN':
+            self.q_net = VAnet(state_dim, hidden_dim, action_dim).to(device)
+            self.target_q_net = VAnet(state_dim, hidden_dim,
+                                      action_dim).to(device)
+        else:
+            self.q_net = QNetwork(state_dim, hidden_dim, action_dim).to(device)
+            self.target_q_net = QNetwork(state_dim, hidden_dim,
+                                         action_dim).to(device)
         self.target_q_net.load_state_dict(
             self.q_net.state_dict())  # Synchronize initially
 
@@ -83,6 +166,8 @@ class DQNAgent:
         self.target_update = target_update  # Target network update frequency
         self.count = 0  # Counter for target updates
         self.device = device
+        self.dqn_type = dqn_type
+        print(f"Using {self.dqn_type}")
 
     def take_action(self, state, deterministic: bool = False):
         """Select action using ε-greedy policy or deterministically.
@@ -106,6 +191,14 @@ class DQNAgent:
                                  device=self.device).item()
         else:  # Exploitation
             return self.q_net(state_tensor).argmax().item()  # Greedy action
+
+    def get_max_q_value(self, state):
+        if isinstance(state, list):
+            state = np.array(state)  # Convert list to numpy array first
+        state_tensor = torch.as_tensor(state,
+                                       dtype=torch.float32,
+                                       device=self.device).unsqueeze(0)
+        return self.q_net(state_tensor).max().item()
 
     def update(self, transition_dict):
         """Perform DQN learning update with experience replay.
@@ -131,9 +224,6 @@ class DQNAgent:
                              dtype=torch.float).view(-1, 1).to(self.device)
 
         # Compute current Q-values for taken actions
-        # self.q_net(states) shape: (batch_size, action_dim)
-        # actions shape: (batch_size, 1), actions are indices
-        # gather(1, actions) selects Q-values for the actions taken
         q_values = self.q_net(states).gather(1, actions)  # Q(s_t, a_t)
 
         # Compute target Q-values using target network
@@ -141,8 +231,17 @@ class DQNAgent:
         # where max_a Q(s_{t+1}, a) is the maximum Q-value for next state
         # NOTE: target network is not updated during training (torch.no_grad())
         with torch.no_grad():  # No gradient for target computation
-            max_next_q_values = self.target_q_net(next_states).max(1)[0].view(
-                -1, 1)
+            if self.dqn_type == 'VanillaDQN' or self.dqn_type == 'DuelingDQN':
+                max_next_q_values = self.target_q_net(next_states).max(
+                    1)[0].view(-1, 1)
+            elif self.dqn_type == 'DoubleDQN':
+                # Action selection using online Q-network
+                max_q_action = self.q_net(next_states).max(1)[1].view(-1, 1)
+                # Action evaluation using target Q-network
+                max_next_q_values = self.target_q_net(next_states).gather(
+                    1, max_q_action)
+            else:
+                raise ValueError(f"Unknown DQN type: {self.dqn_type}")
             q_targets = rewards + self.gamma * max_next_q_values * (
                 1 - dones)  # TD target
 
@@ -214,6 +313,8 @@ def train_dqn_agent(env,
         return_list: List of returns for each episode
     """
     return_list = []
+    max_q_value_list = []
+    max_q_value = 0
 
     if checkpoint_dir is not None:
         os.makedirs(checkpoint_dir, exist_ok=True)
@@ -228,7 +329,13 @@ def train_dqn_agent(env,
                 while not done:
                     # Agent interacts with environment
                     action = agent.take_action(state)
-                    next_state, reward, done, _ = env.step(action)
+                    max_q_value = agent.get_max_q_value(state)
+                    max_q_value_list.append(max_q_value)
+                    action_continuous = discrete_to_continuos(
+                        action, env, agent.action_dim)
+                    # print(action)
+                    # print(action_continuous)
+                    next_state, reward, done, _ = env.step([action_continuous])
 
                     # Store transition in replay buffer
                     replay_buffer.add(state, action, reward, next_state, done)
@@ -267,7 +374,7 @@ def train_dqn_agent(env,
                         print(f"\nSaved checkpoint to {checkpoint_path}")
                 pbar.update(1)
 
-    return return_list
+    return return_list, max_q_value_list
 
 
 def test_agent(env,
@@ -301,7 +408,9 @@ def test_agent(env,
                 time.sleep(pause)
 
             action = agent.take_action(state, deterministic=True)
-            next_state, reward, done, _ = env.step(action)
+            action_continuous = discrete_to_continuos(action, env,
+                                                      agent.action_dim)
+            next_state, reward, done, _ = env.step([action_continuous])
             state = next_state
             episode_return += reward
             episode_length += 1
@@ -321,7 +430,7 @@ def test_agent(env,
     return returns, lengths
 
 
-def plot_results(returns, window_size=10, title="DQN Performance"):
+def plot_returns(returns, window_size=10, title="DQN Performance"):
     """Plot training returns with moving average.
 
     Args:
@@ -347,11 +456,30 @@ def plot_results(returns, window_size=10, title="DQN Performance"):
     plt.show()
 
 
+def plot_max_q_values(max_q_value_list, title="DQN Max Q-value"):
+    """Plot maximum Q-values
+
+    Args:
+        max_q_value_list: List of maximum Q-values from training
+        title: Plot title
+    """
+    plt.figure(figsize=(10, 5))
+    plt.plot(max_q_value_list, label='Max Q-value', alpha=0.3)
+    plt.axhline(0, c='orange', ls='--')
+    plt.axhline(10, c='red', ls='--')
+    plt.xlabel('Frames')
+    plt.ylabel('Max Q-value')
+    plt.title(title)
+    plt.legend()
+    plt.grid(True)
+    plt.show()
+
+
 def main():
     """Main function with training and testing modes."""
     import argparse
 
-    parser = argparse.ArgumentParser(description='DQN for CartPole-v0')
+    parser = argparse.ArgumentParser(description='DQN for Pendulum-v1')
     parser.add_argument('--mode',
                         type=str,
                         default='train',
@@ -368,7 +496,7 @@ def main():
                         help='Directory to save checkpoints during training')
     parser.add_argument('--num_episodes',
                         type=int,
-                        default=500,
+                        default=200,
                         help='Number of training episodes')
     parser.add_argument('--test_episodes',
                         type=int,
@@ -377,16 +505,22 @@ def main():
     parser.add_argument('--render',
                         action='store_true',
                         help='Render environment during testing')
+    parser.add_argument(
+        '--dqn_type',
+        type=str,
+        default='DoubleDQN',
+        help='Type of DQN to use (VanillaDQN or DoubleDQN or DuelingDQN)')
     args = parser.parse_args()
+    assert args.dqn_type in ['VanillaDQN', 'DoubleDQN', 'DuelingDQN']
 
     # Hyperparameters
-    lr = 2e-3  # Learning rate
-    hidden_dim = 64  # Hidden layer dimension
+    lr = 1e-2  # Learning rate
+    hidden_dim = 128  # Hidden layer dimension
     gamma = 0.98  # Discount factor
     epsilon = 0.01  # Exploration rate
-    target_update = 10  # Target network update frequency
-    buffer_size = 10000  # Replay buffer capacity
-    minimal_size = 500  # Minimum replay buffer size before training
+    target_update = 50  # Target network update frequency
+    buffer_size = 5000  # Replay buffer capacity
+    minimal_size = 1000  # Minimum replay buffer size before training
     batch_size = 64  # Training batch size
     device = torch.device("cpu")
     # FIXME: Uncomment the following line if using MPS (Apple Silicon), but it works much slower
@@ -395,8 +529,13 @@ def main():
     print(f"Using device: {device}")
 
     # Environment setup
-    env_name = 'CartPole-v0'
+    env_name = 'Pendulum-v1'
     env = gym.make(env_name)
+    # NOTE: Pendulum-v1 is a continuous action space environment, but we will
+    # discretize it into 11 discrete actions for DQN.
+    state_dim = env.observation_space.shape[0]
+    action_dim = 11
+
     random.seed(42)
     np.random.seed(42)
     env.seed(42)
@@ -405,9 +544,17 @@ def main():
     # Initialize components
     replay_buffer = ReplayBuffer(buffer_size)
     state_dim = env.observation_space.shape[0]
-    action_dim = env.action_space.n
-    agent = DQNAgent(state_dim, hidden_dim, action_dim, lr, gamma, epsilon,
-                     target_update, device)
+    # Pendulum-v1 has continuous action space, but we will discretize it
+    # action_dim = env.action_space.n
+    agent = DQNAgent(state_dim,
+                     hidden_dim,
+                     action_dim,
+                     lr,
+                     gamma,
+                     epsilon,
+                     target_update,
+                     device,
+                     dqn_type=args.dqn_type)
 
     if args.mode == 'train':
         # Training mode
@@ -415,14 +562,15 @@ def main():
             agent.load(args.checkpoint, device)
             print(f"Resumed training from checkpoint: {args.checkpoint}")
 
-        returns = train_dqn_agent(env,
-                                  agent,
-                                  replay_buffer,
-                                  args.num_episodes,
-                                  minimal_size,
-                                  batch_size,
-                                  checkpoint_dir=args.checkpoint_dir,
-                                  checkpoint_freq=50)
+        returns, max_q_value_list = train_dqn_agent(
+            env,
+            agent,
+            replay_buffer,
+            args.num_episodes,
+            minimal_size,
+            batch_size,
+            checkpoint_dir=args.checkpoint_dir,
+            checkpoint_freq=50)
 
         # Save final model
         final_path = os.path.join(args.checkpoint_dir, 'final_model.pth')
@@ -430,7 +578,10 @@ def main():
         print(f"\nSaved final model to {final_path}")
 
         # Plot training results
-        plot_results(returns, title=f'DQN Training on {env_name}')
+        plot_returns(returns, title=f'{args.dqn_type} Training on {env_name}')
+
+        plot_max_q_values(max_q_value_list,
+                          title=f'{args.dqn_type} Max Q-value on {env_name}')
 
         # Quick test after training
         print("\nTesting trained agent...")
