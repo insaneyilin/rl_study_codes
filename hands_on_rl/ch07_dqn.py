@@ -1,5 +1,7 @@
-import collections
+import os
 import random
+import time
+from typing import Optional, Tuple
 
 import gym
 import matplotlib.pyplot as plt
@@ -82,11 +84,12 @@ class DQNAgent:
         self.count = 0  # Counter for target updates
         self.device = device
 
-    def take_action(self, state):
-        """Select action using ε-greedy policy.
+    def take_action(self, state, deterministic: bool = False):
+        """Select action using ε-greedy policy or deterministically.
 
         Args:
             state: Current environment state
+            deterministic: If True, always takes the best action (for testing)
 
         Returns:
             action: Selected action (int)
@@ -97,8 +100,8 @@ class DQNAgent:
                                        dtype=torch.float32,
                                        device=self.device).unsqueeze(0)
 
-        if torch.rand(1,
-                      device=self.device).item() < self.epsilon:  # Exploration
+        if not deterministic and torch.rand(
+                1, device=self.device).item() < self.epsilon:  # Exploration
             return torch.randint(0, self.action_dim, (1, ),
                                  device=self.device).item()
         else:  # Exploitation
@@ -151,9 +154,47 @@ class DQNAgent:
             self.target_q_net.load_state_dict(self.q_net.state_dict())
         self.count += 1
 
+    def save(self, path: str):
+        """Save the agent's Q-network to a file.
 
-def train_dqn_agent(env, agent, replay_buffer, num_episodes, minimal_size,
-                    batch_size):
+        Args:
+            path: Path to save the model
+        """
+        torch.save(
+            {
+                'q_net_state_dict': self.q_net.state_dict(),
+                'target_q_net_state_dict': self.target_q_net.state_dict(),
+                'optimizer_state_dict': self.optimizer.state_dict(),
+                'count': self.count,
+                'epsilon': self.epsilon,
+            }, path)
+
+    def load(self, path: str, device: torch.device):
+        """Load the agent's Q-network from a file.
+
+        Args:
+            path: Path to load the model from
+            device: Device to load the model onto
+        """
+        checkpoint = torch.load(path, map_location=device)
+        self.q_net.load_state_dict(checkpoint['q_net_state_dict'])
+        self.target_q_net.load_state_dict(
+            checkpoint['target_q_net_state_dict'])
+        self.optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
+        self.count = checkpoint['count']
+        self.epsilon = checkpoint['epsilon']
+        self.q_net.to(device)
+        self.target_q_net.to(device)
+
+
+def train_dqn_agent(env,
+                    agent,
+                    replay_buffer,
+                    num_episodes,
+                    minimal_size,
+                    batch_size,
+                    checkpoint_dir: Optional[str] = None,
+                    checkpoint_freq: int = 100):
     """Training loop for DQN agent.
 
     Args:
@@ -163,15 +204,20 @@ def train_dqn_agent(env, agent, replay_buffer, num_episodes, minimal_size,
         num_episodes: Total training episodes
         minimal_size: Minimum replay buffer size before learning starts
         batch_size: Size of minibatches for training
+        checkpoint_dir: Directory to save checkpoints (None to disable)
+        checkpoint_freq: Frequency (in episodes) to save checkpoints
 
     Returns:
         return_list: List of returns for each episode
     """
     return_list = []
 
+    if checkpoint_dir is not None:
+        os.makedirs(checkpoint_dir, exist_ok=True)
+
     for i in range(10):  # 10 progress bars
         with tqdm(total=int(num_episodes / 10), desc=f'Iteration {i}') as pbar:
-            for _ in range(int(num_episodes / 10)):
+            for episode in range(int(num_episodes / 10)):
                 episode_return = 0
                 state = env.reset()
                 done = False
@@ -200,21 +246,139 @@ def train_dqn_agent(env, agent, replay_buffer, num_episodes, minimal_size,
                         agent.update(transition_dict)
 
                 return_list.append(episode_return)
+
                 if len(return_list) % 10 == 0:
+                    avg_return = np.mean(return_list[-10:])
                     pbar.set_postfix({
                         'episode': len(return_list),
-                        'return': np.mean(return_list[-10:])
+                        'return': avg_return
                     })
+                    # Save checkpoint.
+                    if checkpoint_dir is not None and len(
+                            return_list) % checkpoint_freq == 0:
+                        checkpoint_path = os.path.join(
+                            checkpoint_dir,
+                            f'episode_{len(return_list)}_avg_return_{avg_return}.pth'
+                        )
+                        agent.save(checkpoint_path)
+                        print(f"\nSaved checkpoint to {checkpoint_path}")
                 pbar.update(1)
 
     return return_list
 
 
-if __name__ == "__main__":
+def test_agent(env,
+               agent,
+               num_episodes: int = 10,
+               render: bool = True,
+               max_steps: int = 500,
+               pause: float = 0.01):
+    """Test the trained agent.
+
+    Args:
+        env: Environment to test in
+        agent: Trained agent
+        num_episodes: Number of episodes to run
+        render: Whether to render the environment
+        max_steps: Maximum steps per episode
+        pause: Pause time between rendered frames (for visualization)
+    """
+    returns = []
+    lengths = []
+
+    for episode in range(num_episodes):
+        state = env.reset()
+        episode_return = 0
+        episode_length = 0
+        done = False
+
+        while not done and episode_length < max_steps:
+            if render:
+                env.render()
+                time.sleep(pause)
+
+            action = agent.take_action(state, deterministic=True)
+            next_state, reward, done, _ = env.step(action)
+            state = next_state
+            episode_return += reward
+            episode_length += 1
+
+        returns.append(episode_return)
+        lengths.append(episode_length)
+        print(
+            f"Episode {episode + 1}: Return = {episode_return}, Length = {episode_length}"
+        )
+
+    env.close()
+    print(f"\nAverage return: {np.mean(returns):.2f} ± {np.std(returns):.2f}")
+    print(
+        f"Average episode length: {np.mean(lengths):.2f} ± {np.std(lengths):.2f}"
+    )
+
+    return returns, lengths
+
+
+def plot_results(returns, window_size=10, title="DQN Performance"):
+    """Plot training returns with moving average.
+
+    Args:
+        returns: List of returns from training
+        window_size: Size of moving average window
+        title: Plot title
+    """
+    # Calculate moving average
+    moving_avg = np.convolve(returns,
+                             np.ones(window_size) / window_size,
+                             mode='valid')
+
+    plt.figure(figsize=(10, 5))
+    plt.plot(returns, label='Episode Returns', alpha=0.3)
+    plt.plot(moving_avg,
+             label=f'Moving Average (window={window_size})',
+             color='red')
+    plt.xlabel('Episodes')
+    plt.ylabel('Returns')
+    plt.title(title)
+    plt.legend()
+    plt.grid(True)
+    plt.show()
+
+
+def main():
+    """Main function with training and testing modes."""
+    import argparse
+
+    parser = argparse.ArgumentParser(description='DQN for CartPole-v0')
+    parser.add_argument('--mode',
+                        type=str,
+                        default='train',
+                        choices=['train', 'test'],
+                        help='Mode: "train" to train, "test" to load and test')
+    parser.add_argument(
+        '--checkpoint',
+        type=str,
+        default=None,
+        help='Path to checkpoint file for testing or resuming training')
+    parser.add_argument('--checkpoint_dir',
+                        type=str,
+                        default='dqn_checkpoints',
+                        help='Directory to save checkpoints during training')
+    parser.add_argument('--num_episodes',
+                        type=int,
+                        default=500,
+                        help='Number of training episodes')
+    parser.add_argument('--test_episodes',
+                        type=int,
+                        default=10,
+                        help='Number of test episodes')
+    parser.add_argument('--render',
+                        action='store_true',
+                        help='Render environment during testing')
+    args = parser.parse_args()
+
     # Hyperparameters
     lr = 2e-3  # Learning rate
-    num_episodes = 500  # Total training episodes
-    hidden_dim = 128  # Hidden layer dimension
+    hidden_dim = 64  # Hidden layer dimension
     gamma = 0.98  # Discount factor
     epsilon = 0.01  # Exploration rate
     target_update = 10  # Target network update frequency
@@ -242,13 +406,52 @@ if __name__ == "__main__":
     agent = DQNAgent(state_dim, hidden_dim, action_dim, lr, gamma, epsilon,
                      target_update, device)
 
-    # Training
-    returns = train_dqn_agent(env, agent, replay_buffer, num_episodes,
-                              minimal_size, batch_size)
+    if args.mode == 'train':
+        # Training mode
+        if args.checkpoint:  # Resume training from checkpoint
+            agent.load(args.checkpoint, device)
+            print(f"Resumed training from checkpoint: {args.checkpoint}")
 
-    # Plot results
-    plt.plot(returns)
-    plt.xlabel('Episodes')
-    plt.ylabel('Returns')
-    plt.title('DQN Performance on {}'.format(env_name))
-    plt.show()
+        returns = train_dqn_agent(env,
+                                  agent,
+                                  replay_buffer,
+                                  args.num_episodes,
+                                  minimal_size,
+                                  batch_size,
+                                  checkpoint_dir=args.checkpoint_dir,
+                                  checkpoint_freq=50)
+
+        # Save final model
+        final_path = os.path.join(args.checkpoint_dir, 'final_model.pth')
+        agent.save(final_path)
+        print(f"\nSaved final model to {final_path}")
+
+        # Plot training results
+        plot_results(returns, title=f'DQN Training on {env_name}')
+
+        # Quick test after training
+        print("\nTesting trained agent...")
+        test_agent(env,
+                   agent,
+                   num_episodes=args.test_episodes,
+                   render=args.render)
+
+    elif args.mode == 'test':
+        # Testing mode
+        if args.checkpoint is None:
+            # Try to load the final model if no checkpoint specified
+            args.checkpoint = os.path.join(args.checkpoint_dir,
+                                           'final_model.pth')
+
+        agent.load(args.checkpoint, device)
+        print(f"Loaded model from {args.checkpoint}")
+
+        # Test the agent
+        test_agent(env,
+                   agent,
+                   num_episodes=args.test_episodes,
+                   render=args.render)
+
+
+if __name__ == "__main__":
+    main()
